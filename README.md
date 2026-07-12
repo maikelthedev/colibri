@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/colibri.svg" width="500" alt="colibrì — piccolo motore, modello immenso">
+  <img src="assets/colibri.svg" width="500" alt="colibrì — tiny engine, immense model">
 </p>
 
 **Tiny engine, immense model.** Run **GLM-5.2 (744B-parameter MoE)** on a consumer machine with ~25 GB of RAM — in pure C, with zero dependencies, by streaming experts from disk.
@@ -7,7 +7,7 @@
 ```
 $ ./coli chat
   🐦 colibrì v1.0 — GLM-5.2 · 744B MoE · int4 · streaming CPU
-  ✓ pronto in 32s · residente 9.9 GB
+  ✓ ready in 32s · resident 9.9 GB
   › ciao!
   ◆ Ciao! 😊 Come posso aiutarti oggi?
 ```
@@ -26,7 +26,8 @@ The engine is a single C file (`c/glm.c`, ~2,400 lines) plus small headers. No B
 - **Faithful GLM-5.2 (`glm_moe_dsa`) forward** — validated token-exact against a `transformers` oracle (teacher-forcing 32/32, greedy 20/20 on a tiny-random model with the real architecture).
 - **MLA attention** (q/kv-LoRA, interleaved partial RoPE) with **compressed KV-cache**: 576 floats/token instead of 32,768 (57× smaller — GLM-5.2 has 64 heads and no GQA).
 - **DeepSeek-V3-style sigmoid router** (noaux_tc, routed_scaling_factor), shared expert, first-3-dense layers.
-- **Native MTP speculative decoding** — GLM-5.2's own multi-token-prediction head (layer 78) drafts tokens that the main model verifies in one batched forward. **The head must be int8** (the converter does this by default): at int4 draft acceptance collapses to 0–4% and speculation never engages; at int8 it's 39–59% acceptance, **2.2–2.8 tokens/forward** (community-measured, [#8](https://github.com/JustVugg/colibri/issues/8)). Lossless — *and stays lossless under sampling* via rejection sampling. Honest caveat from the same measurement: on a **cold** cache each verified draft routes to extra experts (~660 → ~1100 expert-loads/token), so speculation can be a net *time* loss until the cache/pin warms up — the adaptive guard and `DRAFT=0` are there for that.
+- **Native MTP speculative decoding** — GLM-5.2's own multi-token-prediction head (layer 78) drafts tokens that the main model verifies in one batched forward. **The head must be int8** (the converter does this by default): at int4 draft acceptance collapses to 0–4% and speculation never engages; at int8 it's 39–59% acceptance, **2.2–2.8 tokens/forward** (community-measured, [#8](https://github.com/JustVugg/colibri/issues/8)). Lossless *in exact arithmetic* — but **not byte-identical to non-speculative greedy in practice** ([#100](https://github.com/JustVugg/colibri/issues/100)): the batched verification forward (S>1) uses shape-dependent integer kernels that round differently from the S=1 path, so on a near-tie the greedy argmax can flip. Every emitted token is still the argmax of a valid forward — the continuation stays correct — it just isn't bit-for-bit the same stream; `DRAFT=0` (or the adaptive guard) gives byte-exact greedy. Under sampling, rejection sampling keeps the distribution correct. Honest caveat from the same measurement: on a **cold** cache each verified draft routes to extra experts (~660 → ~1100 expert-loads/token), so speculation can be a net *time* loss until the cache/pin warms up.
+- **Grammar-forced speculative drafts** (`GRAMMAR=file.gbnf`, [#48](https://github.com/JustVugg/colibri/issues/48)) — on constrained-output workloads (JSON/NDJSON, function calling, structured extraction) the grammar itself is a third draft source: wherever it admits exactly **one** legal byte (braces, quotes, key names, enum bodies), that forced span is tokenized and injected as pre-accepted drafts with ~1.0 acceptance — no draft head, no lookup table, and it engages even with the int4 MTP head from [#8](https://github.com/JustVugg/colibri/issues/8). It never constrains sampling: forced spans are verified in the same batch-union forward as any draft, so a wrong or out-of-sync grammar cannot change the output — worst case is rejected drafts, and an adaptive guard turns the source off below 50% acceptance. Byte-level GBNF subset (literals, char classes, `| ( ) ? * +`, comments); `GRAMMAR_DRAFT=n` caps the forced span per forward (default 24). Composes with `DRAFT`/MTP, which fill the free-text gaps between forced spans.
 - **True sampling** — temperature + nucleus, defaults tuned for int4 reality (0.7 / 0.90; the official 1.0 / 0.95 samples quantization noise from the tail).
 - **Integer-dot kernels** (Q8_0-style int8 activations, AVX2 `maddubs`): int8 matmuls 1.4–2.5× faster (119 GFLOP/s measured), int4 1.8× in batch — routing decided per shape by measurement (int4 single-row stays f32: it measured slower).
 - **MLA weight absorption** (DeepSeek trick) for decode: no per-token k/v reconstruction — the query absorbs `kv_b`, context is projected after attention. Validated exact: TF 32/32 and generation 20/20 with absorption forced everywhere.
@@ -49,7 +50,7 @@ The engine is a single C file (`c/glm.c`, ~2,400 lines) plus small headers. No B
 | load time | ~30 s |
 | peak RSS during chat | ~20 GB (auto-capped) |
 | cold decode cost | ~11 GB disk reads/token (75 layers × 8 experts) |
-| disk ceiling (VHDX random) | ~1 GB/s → ~0.05–0.1 tok/s cold |
+| disk ceiling (this dev box's drive) | ~1 GB/s → ~0.05–0.1 tok/s cold |
 | MTP speculation (int8 head) | 2.2–2.8 tok/forward measured ([#8](https://github.com/JustVugg/colibri/issues/8)) |
 
 This is not fast. It is a 744B frontier-class model **answering correctly on a machine that costs less than one H100 fan**. Warm cache, pinned hot experts and MTP push the useful-response latency down considerably; the physics of the disk does the rest.
@@ -153,7 +154,7 @@ make test-python        # run Python tests (requires python)
 # Verify (tiny model, 2.4 MB):
 pip install torch transformers safetensors huggingface_hub
 python tools/make_glm_oracle.py                # generate tiny oracle
-SNAP=./glm_tiny TF=1 ./glm.exe 64 16 16        # expect "32/32 posizioni"
+SNAP=./glm_tiny TF=1 ./glm.exe 64 16 16        # expect "32/32 positions"
 
 # Run with real model:
 SNAP=D:\glm52_i4 ./glm.exe 64 4 16            # batch inference
@@ -312,7 +313,7 @@ works against the colibrì OpenAI-compatible server (in review, #21) or any othe
 compatible endpoint. Nothing leaves the endpoint you configure. The terminal
 `coli chat` remains the first-class interface.
 
-Useful knobs (env or flags): `--temp T` token sampling temperature (default 0.7 + nucleus 0.90 — tuned for int4; 0 = greedy), `--topp 0.7` adaptive expert top-p (30–40% less disk), `--ngen N` max tokens per answer (`:piu` in chat continues a truncated one), `--repin N` adapt RAM/VRAM hot experts every N emitted tokens, `AUTOPIN=0` disable the learning cache's auto-pin, `THINK=1` enable GLM-5.2's reasoning block, `DRAFT=n` MTP draft depth, `TF=1` teacher-forcing validation, `PILOT=1` router-lookahead disk prefetch (experimental — see below), `CAP_RAISE=0` don't auto-grow the expert cache.
+Useful knobs (env or flags): `--temp T` token sampling temperature (default 0.7 + nucleus 0.90 — tuned for int4; 0 = greedy), `--topp 0.7` adaptive expert top-p (30–40% less disk), `--ngen N` max tokens per answer (`:more` in chat continues a truncated one), `--repin N` adapt RAM/VRAM hot experts every N emitted tokens, `AUTOPIN=0` disable the learning cache's auto-pin, `THINK=1` enable GLM-5.2's reasoning block, `DRAFT=n` MTP draft depth, `GRAMMAR=g.gbnf` grammar-forced drafts for constrained JSON/NDJSON output (`GRAMMAR_DRAFT=n` caps the forced span), `TF=1` teacher-forcing validation, `PILOT=1` router-lookahead disk prefetch (experimental — see below), `CAP_RAISE=0` don't auto-grow the expert cache.
 
 **The expert cache auto-sizes to your RAM** (since 2026-07-10): the engine now *raises* the LRU cap to fill your `--ram` budget instead of only lowering it. Before this fix a 128 GB machine ran with the same 8-experts/layer cache as a 16 GB one (issue #12) — **if you benchmarked colibrì before this date, rerun: your numbers were capped.**
 
@@ -330,7 +331,7 @@ thrashing. Persistent `.coli_usage` remains the long-term signal and is not deca
 
 ## Got a better machine? Try it — here's what to expect
 
-colibrì was built on deliberately humble hardware (12 cores, 25 GB RAM, NVMe behind a WSL2 VHDX that caps random reads at ~1 GB/s). **Every one of those constraints is a knob your machine can turn up.** The engine needs: Linux (or WSL2), macOS, or **Windows 11 natively (MinGW-w64)**; gcc with OpenMP, AVX2, ≥16 GB RAM, and the ~370 GB int4 model on a local NVMe (ext4/NTFS — never a network/9p mount).
+colibrì was built on deliberately humble hardware (12 cores, 25 GB RAM, an older DRAM-less NVMe behind a WSL2 VHDX that measured ~1 GB/s random on *this* drive — note WSL2 VHDX is not inherently slow: a community 5090 box measured 10.5 GB/s O_DIRECT through one, [#101](https://github.com/JustVugg/colibri/issues/101)). **Every one of those constraints is a knob your machine can turn up.** The engine needs: Linux (or WSL2), macOS, or **Windows 11 natively (MinGW-w64)**; gcc with OpenMP, AVX2, ≥16 GB RAM, and the ~370 GB int4 model on a local NVMe (ext4/NTFS — never a network/9p mount).
 
 **How to test it, in order:**
 
@@ -340,7 +341,13 @@ cd c && ./setup.sh                 # build + architecture self-test (expects 32/
 # 1) measure YOUR disk the way the engine uses it (parallel 19 MB random reads):
 gcc -O2 -fopenmp iobench.c -o iobench
 ./iobench /path/to/glm52_i4/out-00069.safetensors 19 64 8 0   # buffered, 8 threads
-./iobench /path/to/glm52_i4/out-00069.safetensors 19 64 8 1   # O_DIRECT
+./iobench /path/to/glm52_i4/out-00069.safetensors 19 64 8 1   # O_DIRECT (bypass cache)
+# Caveat (#86): iobench reads a bounded ~1 GB shard, so buffered reads on a big-RAM box
+# report the PAGE CACHE, not the disk. Use the O_DIRECT run (arg 1) for a true number, and
+# run it on a shard you haven't touched this session (a prior buffered run caches its pages).
+# On macOS there is no O_DIRECT — iobench uses F_NOCACHE, which stops *new* caching but can't
+# evict pages a prior buffered run already resident-mapped, so a macOS "O_DIRECT" figure right
+# after a buffered run still reads cache. Reboot or use a fresh shard for a real cold read.
 
 # 2) chat; watch the per-turn stats line (tok/s, expert hit-rate, RSS):
 COLI_MODEL=/path/to/glm52_i4 ./coli chat
@@ -373,7 +380,8 @@ Real numbers from real machines, stock build (`setup.sh`, gcc 13), greedy decodi
 |---|---|---|---|
 | Intel Core Ultra 7 270K Plus (24 threads) · WSL2 · 24 GB RAM · NVMe VHDX ([#2](https://github.com/JustVugg/colibri/issues/2)) | 1.96 GB/s buffered · 2.74 GB/s O_DIRECT | default | 0.07 tok/s · expert hit 3–4% · RSS 14.1 GB |
 | 〃 | 〃 | `--topp 0.7` | **0.11 tok/s** · expert hit 11% · RSS 14.7 GB |
-| Apple M5 Max (18 cores) · macOS · 128 GB unified · internal SSD ([#4](https://github.com/JustVugg/colibri/issues/4), [#5](https://github.com/JustVugg/colibri/issues/5)) | 14.2 GB/s O_DIRECT | default, MTP off | **1.06 tok/s** · expert hit 23% · RSS 21.8 GB |
+| Apple M5 Max (18 cores) · macOS · 128 GB unified · internal SSD ([#4](https://github.com/JustVugg/colibri/issues/4), [#5](https://github.com/JustVugg/colibri/issues/5)) | ~4 GB/s cold (the 14.2 GB/s reading was cache-influenced — see note) | default, MTP off | **1.06 tok/s** · expert hit 23% · RSS 21.8 GB |
+| Apple M5 Max · macOS · 128 GB unified · 2 TB SSD · **Metal backend** ([#72](https://github.com/JustVugg/colibri/pull/72), [#87](https://github.com/JustVugg/colibri/issues/87)) | (macOS O_DIRECT figure unreliable — see note) | Metal on · `--ram 96` · 39.7 GB warm pin · MTP off | **1.83 tok/s** · expert hit 66% · warmed 1.11 → 1.83 over the run |
 | Epyc 9654 ES · Linux · 4x16GB DDR5-4800-rdimm · Samsung PCIe Gen3 x4 NVME SSD | — | `MTP=1 DIRECT=1` | 0.31 tok/s · expert hit 35% · RSS 21.52 GB |
 | Ryzen AI 9 HX 370 (Framework 13) · Arch Linux · 128 GB · WD SN850X, BTRFS zstd ([#12](https://github.com/JustVugg/colibri/issues/12)) | — | int8 MTP head · `--cap 32` · 46.7 GB auto-learned PIN | **0.37 tok/s** · expert hit 66% · MTP acceptance 52% (2.59 tok/fw) · RSS 105 GB |
 | Ryzen 9 9950X (32 threads) · Linux · 123 GB · Crucial P3 QLC Gen3 ([#31](https://github.com/JustVugg/colibri/issues/31)) | 1.51 GB/s buffered | default, 2 runs from cold | 0.10 tok/s · hit 53% · profile 66% disk |
